@@ -2,7 +2,6 @@
 # =========================================================
 # Debian 11 → 12 → 13 自動升級腳本
 # 適用於：Debian 11 (Bullseye) 到 Debian 13 (Trixie)
-# 作者：ChatGPT (GPT-5)
 # =========================================================
 
 set -e
@@ -24,15 +23,7 @@ backup_sources() {
     sudo cp /etc/apt/sources.list /etc/apt/sources.list.backup.$(date +%Y%m%d_%H%M%S)
 }
 
-update_system() {
-    echo ""
-    echo "==== 更新並清理系統 ===="
-    sudo apt update
-    sudo apt full-upgrade -y
-    sudo apt --fix-broken install -y
-    sudo apt autoremove --purge -y
-    sudo apt clean
-}
+# ... (update_system 函數可以保留，雖然主流程沒用到) ...
 
 upgrade_to_bookworm() {
     echo ""
@@ -40,13 +31,14 @@ upgrade_to_bookworm() {
     backup_sources
     sudo sed -i 's/bullseye/bookworm/g' /etc/apt/sources.list
     sudo apt update
-    sudo apt upgrade -y
-    sudo apt full-upgrade -y
+    sudo apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade -y
     sudo apt --fix-broken install -y
     sudo apt autoremove --purge -y
     echo ""
-    echo "升級到 Debian 12 完成，將重啟系統..."
-    # sudo reboot
+    echo "✅ 第一階段升級完成！"
+    echo "🚨 系統需要重啟以加載 Debian 12 的新內核。"
+    echo "   請手動執行 'sudo reboot' 來重啟。"
+    echo "   重啟並重新登錄後，請再次運行同一個腳本以繼續升級到 Debian 13。"
 }
 
 upgrade_to_trixie() {
@@ -55,13 +47,14 @@ upgrade_to_trixie() {
     backup_sources
     sudo sed -i 's/bookworm/trixie/g' /etc/apt/sources.list
     sudo apt update
-    sudo apt upgrade -y
-    sudo apt full-upgrade -y
+    sudo apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade -y
     sudo apt --fix-broken install -y
     sudo apt autoremove --purge -y
     echo ""
-    echo "升級到 Debian 13 完成，將重啟系統..."
-    sudo reboot
+    echo "✅ 第二階段升級完成！"
+    echo "🚨 系統需要重啟以完成 Debian 13 的升級。"
+    echo "   請手動執行 'sudo reboot' 來重啟。"
+    echo "   重啟後，您可以選擇再次運行腳本進行最終檢查。"
 }
 
 final_check() {
@@ -74,37 +67,40 @@ final_check() {
     sudo apt clean
     sudo apt autoremove -y
     echo ""
-    echo "✅ 升級已完成！"
+    echo "✅ 您的系統已是 Debian 13，升級已完成！"
 }
 
 # --- 主流程 ---
 echo "========================================================="
-echo "  Debian 自動升級腳本：11 → 12 → 13"
+echo "  Debian 狀態感知升級腳本：11 → 12 → 13"
 echo "========================================================="
+
+# 獲取版本信息，如果命令失敗則退出
+if ! source /etc/os-release; then
+    echo "錯誤：無法讀取 /etc/os-release 文件來確定系統版本。"
+    exit 1
+fi
 
 check_version
 pause
 
-# 新增版本判斷邏輯
-source /etc/os-release
-CURRENT_VERSION=$VERSION_ID
-CURRENT_CODENAME=$VERSION_CODENAME
-
-case "$CURRENT_CODENAME" in
+case "$VERSION_CODENAME" in
   bullseye)
-    echo "目前為 Debian 11 → 將升級至 12"
+    echo "檢測到 Debian 11 (Bullseye)。準備升級至 Debian 12。"
     upgrade_to_bookworm
     ;;
   bookworm)
-    echo "目前為 Debian 12 → 將升級至 13"
+    echo "檢測到 Debian 12 (Bookworm)。準備升級至 Debian 13。"
     upgrade_to_trixie
     ;;
   trixie)
-    echo "已是 Debian 13，無需升級。"
+    echo "檢測到系統已是 Debian 13 (Trixie)。"
     final_check
     ;;
   *)
-    echo "未知版本：$CURRENT_CODENAME，請手動確認。"
+    echo "錯誤：不支持的版本 ($VERSION_CODENAME)。腳本終止。"
     exit 1
     ;;
 esac
+
+exit 0
