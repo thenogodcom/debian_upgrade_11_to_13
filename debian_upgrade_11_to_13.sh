@@ -1,10 +1,14 @@
 #!/bin/bash
 # =========================================================
 # Debian 11 → 12 → 13 自動升級腳本
-# 適用於：Debian 11 (Bullseye) 到 Debian 13 (Trixie)
+# 特性: 日誌記錄, 健壯的源處理, 狀態感知, 分階段執行
 # =========================================================
 
 set -e
+LOGFILE="/var/log/debian_upgrade_$(date +%Y%m%d_%H%M%S).log"
+
+# 將所有輸出同時打印到屏幕和日誌文件
+exec > >(tee -a "$LOGFILE") 2>&1
 
 # --- 函數定義 ---
 pause() {
@@ -23,61 +27,56 @@ backup_sources() {
     sudo cp /etc/apt/sources.list /etc/apt/sources.list.backup.$(date +%Y%m%d_%H%M%S)
 }
 
-# ... (update_system 函數可以保留，雖然主流程沒用到) ...
-
-upgrade_to_bookworm() {
-    echo ""
-    echo "==== 開始升級 Debian 11 → 12 (Bookworm) ===="
-    backup_sources
-    sudo sed -i 's/bullseye/bookworm/g' /etc/apt/sources.list
-    sudo apt update
-    sudo apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade -y
-    sudo apt --fix-broken install -y
-    sudo apt autoremove --purge -y
-    echo ""
-    echo "✅ 第一階段升級完成！"
-    echo "🚨 系統需要重啟以加載 Debian 12 的新內核。"
-    echo "   請手動執行 'sudo reboot' 來重啟。"
-    echo "   重啟並重新登錄後，請再次運行同一個腳本以繼續升級到 Debian 13。"
+# 改良的源文件處理函數
+fix_sources() {
+    FROM_CODENAME=$1
+    TO_CODENAME=$2
+    echo "正在將源從 '$FROM_CODENAME' 更新到 '$TO_CODENAME'..."
+    # 使用 find 命令處理 /etc/apt/sources.list 和 /etc/apt/sources.list.d/ 中的所有 .list 文件
+    sudo find /etc/apt/ -name "*.list" -type f -exec sed -i \
+        -e "s/${FROM_CODENAME}-security/${TO_CODENAME}-security/g" \
+        -e "s/${FROM_CODENAME}-updates/${TO_CODENAME}-updates/g" \
+        -e "s/${FROM_CODENAME}-backports/${TO_CODENAME}-backports/g" \
+        -e "s/${FROM_CODENAME}/${TO_CODENAME}/g" '{}' +
 }
 
-upgrade_to_trixie() {
-    echo ""
-    echo "==== 開始升級 Debian 12 → 13 (Trixie) ===="
-    backup_sources
-    sudo sed -i 's/bookworm/trixie/g' /etc/apt/sources.list
+# 統一的升級步驟函數
+perform_upgrade_steps() {
+    echo "開始更新軟件包列表並執行升級..."
+    export DEBIAN_FRONTEND=noninteractive
     sudo apt update
-    sudo apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade -y
+    sudo apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y full-upgrade
     sudo apt --fix-broken install -y
     sudo apt autoremove --purge -y
-    echo ""
-    echo "✅ 第二階段升級完成！"
-    echo "🚨 系統需要重啟以完成 Debian 13 的升級。"
-    echo "   請手動執行 'sudo reboot' 來重啟。"
-    echo "   重啟後，您可以選擇再次運行腳本進行最終檢查。"
+    sudo apt clean
 }
 
-final_check() {
+# 最終檢查和重啟提示
+final_check_and_reboot() {
     echo ""
-    echo "==== 驗證系統版本 ===="
+    echo "==== 驗證最終系統版本 ===="
     lsb_release -a || cat /etc/debian_version
     uname -a
     echo ""
-    echo "==== 系統清理 ===="
-    sudo apt clean
-    sudo apt autoremove -y
+    echo "✅ 升級流程已全部完成！日誌已保存至：$LOGFILE"
     echo ""
-    echo "✅ 您的系統已是 Debian 13，升級已完成！"
+    read -rp "是否立即重啟以應用所有變更？(y/n): " REBOOT
+    if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
+        echo "正在重啟..."
+        sudo reboot
+    else
+        echo "請記得稍後手動重啟。"
+    fi
 }
+
 
 # --- 主流程 ---
 echo "========================================================="
-echo "  Debian 狀態感知升級腳本：11 → 12 → 13"
+echo "  Debian 狀態感知升級腳本"
 echo "========================================================="
 
-# 獲取版本信息，如果命令失敗則退出
 if ! source /etc/os-release; then
-    echo "錯誤：無法讀取 /etc/os-release 文件來確定系統版本。"
+    echo "錯誤：無法讀取 /etc/os-release 文件。" >&2
     exit 1
 fi
 
@@ -86,19 +85,30 @@ pause
 
 case "$VERSION_CODENAME" in
   bullseye)
-    echo "檢測到 Debian 11 (Bullseye)。準備升級至 Debian 12。"
-    upgrade_to_bookworm
+    echo "檢測到 Debian 11。準備升級至 Debian 12..."
+    backup_sources
+    fix_sources bullseye bookworm
+    perform_upgrade_steps
+    echo ""
+    echo "✅ 第一階段 (-> Debian 12) 完成！"
+    echo "🚨 請立即手動重啟 ('sudo reboot')，然後再次運行此腳本繼續升級。"
+    exit 0 # <--- 關鍵：在此處退出，強制分階段執行
     ;;
   bookworm)
-    echo "檢測到 Debian 12 (Bookworm)。準備升級至 Debian 13。"
-    upgrade_to_trixie
+    echo "檢測到 Debian 12。準備升級至 Debian 13..."
+    backup_sources
+    fix_sources bookworm trixie
+    perform_upgrade_steps
+    echo ""
+    echo "✅ 第二階段 (-> Debian 13) 完成！"
+    final_check_and_reboot # <--- 升級到最終版本後，才進行檢查和重啟
     ;;
   trixie)
     echo "檢測到系統已是 Debian 13 (Trixie)。"
-    final_check
+    final_check_and_reboot
     ;;
   *)
-    echo "錯誤：不支持的版本 ($VERSION_CODENAME)。腳本終止。"
+    echo "錯誤：不支持的版本 ($VERSION_CODENAME)。腳本終止。" >&2
     exit 1
     ;;
 esac
