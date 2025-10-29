@@ -81,25 +81,30 @@ final_check() {
 echo "========================================================="
 echo "  Debian 自動升級腳本：11 → 12 → 13"
 echo "========================================================="
+
 check_version
-echo "請確保："
-echo "  1. 已備份 /etc /home /var/www /usr/local"
-echo "  2. 已停用所有第三方源 (Docker, MariaDB, NodeSource 等)"
-echo "  3. 有足夠磁碟空間 (>2GB)"
-echo ""
 pause
 
-echo "第一階段：升級至 Debian 12 (Bookworm)"
-upgrade_to_bookworm
+# 新增版本判斷邏輯
+source /etc/os-release
+CURRENT_VERSION=$VERSION_ID
+CURRENT_CODENAME=$VERSION_CODENAME
 
-# --- 第二次啟動後繼續 ---
-if grep -q "bookworm" /etc/apt/sources.list; then
-    echo "檢測到系統為 Debian 12，準備升級至 Debian 13..."
-    pause
+case "$CURRENT_CODENAME" in
+  bullseye)
+    echo "目前為 Debian 11 → 將升級至 12"
+    upgrade_to_bookworm
+    ;;
+  bookworm)
+    echo "目前為 Debian 12 → 將升級至 13"
     upgrade_to_trixie
-fi
-
-# --- 第三次啟動後檢查 ---
-if grep -q "trixie" /etc/apt/sources.list; then
+    ;;
+  trixie)
+    echo "已是 Debian 13，無需升級。"
     final_check
-fi
+    ;;
+  *)
+    echo "未知版本：$CURRENT_CODENAME，請手動確認。"
+    exit 1
+    ;;
+esac
