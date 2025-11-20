@@ -1,16 +1,22 @@
 #!/bin/bash
 # =================================================================
-# Debian 11 → 12 → 13 全自動無人值守【雲端核心】升級腳本 (最終修復版)
+# Debian 11 → 12 → 13 全自動無人值守【雲端核心】升級腳本 (生產環境最終版)
 # =================================================================
 #
-# 【警告】: 此腳本已修改為專門安裝和使用為雲端伺服器優化的核心
-# (linux-image-cloud-*). 請勿在需要特定硬體驅動的桌面或
-# 實體伺服器上使用，否則可能導致無法開機或設備不工作。
+# 【變更日誌】:
+# - Fix: SSH 斷線防護 (trap HUP)
+# - Fix: 軟體源 non-free-firmware 修復
+# - Fix: 顯式執行 Cleanup 防止重啟後服務遺失 (審查修復 #3)
+# - Add: 磁碟空間檢查 > 5GB (審查修復 #4)
+# - Add: 網路連線檢查 (審查修復 #5)
 #
+# =================================================================
 
 # --- 腳本執行設定 ---
 set -e
 export DEBIAN_FRONTEND=noninteractive
+# 防止 SSH 斷線導致腳本中止
+trap '' HUP
 
 # --- 日誌設定 ---
 LOGFILE="/var/log/debian_cloud_upgrade_$(date +%Y%m%d_%H%M%S).log"
@@ -19,215 +25,239 @@ exec > >(sudo tee -a "$LOGFILE") 2>&1
 # --- 全域常數 ---
 APT_NONINTERACTIVE_OPTIONS="-y --allow-downgrades --allow-remove-essential --allow-change-held-packages -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef"
 ARCH=$(dpkg --print-architecture)
+REQUIRED_SPACE_MB=5120 # 5GB
 
-# --- 函數定義 ---
+# --- 檢查函數 (Pre-flight Checks) ---
 
-# 【根本性修復】: 新增函數，使用 debconf-set-selections 預先回答關鍵問題
-# 這是解決 libc6 彈出視窗的最可靠方法。
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+       echo "錯誤：此腳本必須以 root 身份運行 (sudo)。" >&2
+       exit 1
+    fi
+}
+
+check_network() {
+    echo "--- [0/7] 檢查網路連線 ---"
+    # 嘗試 ping debian.org 或 google dns，超時 5 秒
+    if ping -c 1 -W 5 deb.debian.org >/dev/null 2>&1 || ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1; then
+        echo "網路連線正常。"
+    else
+        echo "錯誤：無法連線到網際網路，請檢查網路設定。" >&2
+        exit 1
+    fi
+}
+
+check_disk_space() {
+    echo "--- [0/7] 檢查磁碟空間 ---"
+    # 獲取根目錄可用空間 (MB)
+    local available_space
+    available_space=$(df / --output=avail -B M | tail -n 1 | tr -d 'M[:space:]')
+    
+    echo "根目錄可用空間: ${available_space} MB (需求: ${REQUIRED_SPACE_MB} MB)"
+    
+    if [ "$available_space" -lt "$REQUIRED_SPACE_MB" ]; then
+        echo "錯誤：磁碟空間不足！建議至少保留 5GB 空間進行發行版升級。" >&2
+        exit 1
+    fi
+}
+
+# --- 核心函數 ---
+
 preseed_debconf() {
-    echo "--- 預先配置 debconf 以避免互動 ---"
-    # 使用 here-document 傳入配置，可讀性更好
-    # libraries/restart-without-asking=true 會自動回答 "Restart services during package upgrades without asking?" 為 <Yes>
+    echo "--- [1/7] 準備環境依賴 ---"
+    sudo apt-get update -q || echo "警告: apt update 返回非零狀態，嘗試繼續..."
+    
+    if ! sudo apt-get install -y debconf-utils psmisc; then
+        echo "錯誤：無法安裝必要工具 (debconf-utils/psmisc)。" >&2
+        exit 1
+    fi
+
+    echo "預先配置 debconf..."
     sudo debconf-set-selections <<EOF
 libc6 libraries/restart-without-asking boolean true
 EOF
-    echo "debconf 已預先配置。"
 }
 
-
 configure_unattended_tools() {
-    echo "配置 unattended-upgrades 和 needrestart 為非互動模式..."
+    echo "暫停自動更新服務..."
     sudo systemctl stop unattended-upgrades.service || true
     sudo systemctl disable unattended-upgrades.service || true
+    
     if [ -f /etc/needrestart/needrestart.conf ]; then
         sudo sed -i "s/^#*\$nrconf{restart}.*/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
-        echo "needrestart 已配置為自動重啟服務。"
     fi
+    
     if ! dpkg -s apt-listchanges >/dev/null 2>&1; then
         sudo apt-get install -y apt-listchanges
     fi
     sudo sed -i "s/frontend=.*/frontend=none/" /etc/apt/apt.conf.d/20listchanges
 }
 
-cleanup() {
-    echo "腳本執行結束，正在恢復 unattended-upgrades 服務..."
+# 恢復服務函數 (需在退出或重啟前顯式調用)
+restore_services() {
+    echo "正在恢復 unattended-upgrades 服務狀態..."
     sudo systemctl enable unattended-upgrades.service || true
     sudo systemctl start unattended-upgrades.service || true
-    echo "服務已恢復。"
+    echo "服務恢復完成。"
 }
-trap cleanup EXIT
+
+# Trap 僅作為異常退出的保險，正常重啟流程應顯式調用 restore_services
+trap restore_services EXIT
 
 pause() {
     echo ""
-    read -rp ">>> 這是一個全自動【雲端核心】升級腳本，將在5秒後繼續，按 Ctrl+C 中止..." -t 5 <> /dev/tty || true
+    if [ -t 0 ]; then
+        read -rp ">>> 將在 5 秒後繼續，按 Ctrl+C 中止..." -t 5 <> /dev/tty || true
+    else
+        echo ">>> 無人值守模式：將在 5 秒後自動繼續..."
+        sleep 5
+    fi
 }
 
 detect_system() {
-    # ... (此函數無變更) ...
-    echo "--- 檢測系統狀態 ---"
+    echo "--- [2/7] 檢測系統狀態 ---"
     if [ ! -f /etc/os-release ]; then
-        echo "錯誤：無法讀取 /etc/os-release，無法確定系統版本。" >&2
+        echo "錯誤：無法讀取 /etc/os-release。" >&2
         exit 1
     fi
     . /etc/os-release
     export USERLAND_CODENAME="${VERSION_CODENAME:-unknown}"
-    echo "使用者空間 (Userland) 版本: $PRETTY_NAME"
-    KERNEL_VERSION=$(uname -r)
-    echo "正在運行的核心版本: $KERNEL_VERSION"
-    case "${KERNEL_VERSION%%.*}" in
-        5) KERNEL_CODENAME="bullseye" ;;
-        6)
-            if dpkg --compare-versions "$KERNEL_VERSION" "lt" "6.2"; then
-                KERNEL_CODENAME="bookworm"
-            else
-                KERNEL_CODENAME="trixie"
-            fi
-            ;;
-        *) KERNEL_CODENAME="unknown" ;;
-    esac
-    echo "核心推斷發行版: $KERNEL_CODENAME"
-    if [[ "$USERLAND_CODENAME" == "$KERNEL_CODENAME" ]]; then
-        export SYSTEM_STATE="$USERLAND_CODENAME"
-        echo "狀態診斷: 核心與使用者空間匹配 ($SYSTEM_STATE)"
-    else
-        export SYSTEM_STATE="MISMATCHED_KERNEL"
-        echo "警告: 核心與使用者空間版本不匹配！(使用者空間: $USERLAND_CODENAME / 核心: $KERNEL_CODENAME)"
-    fi
-    echo "---------------------------"
+    export SYSTEM_STATE="$USERLAND_CODENAME"
+    
+    echo "當前發行版: $USERLAND_CODENAME"
+    echo "當前核心: $(uname -r)"
 }
 
 backup_sources() {
-    # ... (此函數無變更) ...
     echo "備份 APT 來源..."
-    local backup_timestamp
-    backup_timestamp=$(date +%F_%T)
-    sudo cp -a /etc/apt/sources.list "/etc/apt/sources.list.backup.${backup_timestamp}"
+    local ts=$(date +%F_%T)
+    sudo cp -a /etc/apt/sources.list "/etc/apt/sources.list.backup.${ts}"
     [ -d /etc/apt/sources.list.d ] && \
-        sudo cp -a /etc/apt/sources.list.d "/etc/apt/sources.list.d.backup.${backup_timestamp}"
+        sudo cp -a /etc/apt/sources.list.d "/etc/apt/sources.list.d.backup.${ts}"
 }
 
 fix_sources() {
-    # ... (此函數無變更) ...
     local FROM=$1
     local TO=$2
-    echo "更新來源: $FROM -> $TO"
+    echo "--- [3/7] 更新軟體源: $FROM -> $TO ---"
+    
+    # 修復舊式安全源格式
+    if grep -q "${FROM}/updates" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; then
+        sudo find /etc/apt/ -name "*.list" -type f -exec sed -i "s|${FROM}/updates|${FROM}-security|g" '{}' +
+    fi
+
+    # 執行版本替換
     sudo find /etc/apt/ -name "*.list" -type f -exec sed -i \
         "s/${FROM}-security/${TO}-security/g; s/${FROM}-updates/${TO}-updates/g; s/${FROM}-backports/${TO}-backports/g; s/${FROM}/${TO}/g" '{}' +
+
+    # 適配 non-free-firmware
+    if [[ "$TO" == "bookworm" ]] || [[ "$TO" == "trixie" ]]; then
+        # 確保 non-free 和 main 後面都跟著 non-free-firmware
+        sudo find /etc/apt/ -name "*.list" -type f -exec sed -i \
+            '/non-free/ { /non-free-firmware/! s/non-free/non-free non-free-firmware/g }' '{}' +
+        sudo find /etc/apt/ -name "*.list" -type f -exec sed -i \
+            '/main/ { /non-free/! { /non-free-firmware/! s/main/main non-free-firmware/g } }' '{}' +
+    fi
 }
 
 repair_dpkg() {
-    # 【防禦性加固】: 使用 -E 參數確保 sudo 繼承 DEBIAN_FRONTEND 環境變數
-    if sudo lsof /var/lib/dpkg/lock >/dev/null 2>&1 || sudo lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
-        echo "警告：檢測到 dpkg 鎖文件，正在強制移除..."
+    if sudo lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
+        echo "移除 dpkg 鎖..."
         sudo fuser -k /var/lib/dpkg/lock || true
-        sudo fuser -k /var/lib/dpkg/lock-frontend || true
         sudo rm -f /var/lib/dpkg/lock*
     fi
     if ! sudo dpkg --audit >/dev/null 2>&1; then
-        echo "警告：檢測到 dpkg 存在未完成的設定，正在嘗試自動修復..."
+        echo "修復中斷的安裝..."
         sudo dpkg --configure -a
         sudo -E apt ${APT_NONINTERACTIVE_OPTIONS} -f install
-        echo "dpkg 修復完成。"
-    else
-        echo "dpkg 狀態檢查通過。"
     fi
 }
 
 perform_upgrade() {
     repair_dpkg
-    echo "開始更新套件列表..."
+    echo "--- [4/7] 執行系統升級 ---"
     sudo -E apt update
-    echo "開始全系統升級..."
-    # 【防禦性加固】: 使用 -E 參數確保 sudo 繼承 DEBIAN_FRONTEND 環境變數
     sudo -E apt ${APT_NONINTERACTIVE_OPTIONS} full-upgrade
-    echo "執行最終清理..."
     sudo -E apt ${APT_NONINTERACTIVE_OPTIONS} --fix-broken install
-    sudo -E apt autoremove --purge
+    sudo -E apt autoremove --purge -y
     sudo -E apt clean
 }
 
 upgrade_to_cloud_kernel() {
-    echo "--- 標準化至最新的【雲端服務核心】(架構: ${ARCH}) ---"
+    echo "--- [5/7] 標準化至【雲端服務核心】 ---"
     sudo -E apt update
-    echo "步驟 1: 安裝最新的雲端核心元數據包..."
     sudo -E apt ${APT_NONINTERACTIVE_OPTIONS} --no-install-recommends install "linux-image-cloud-${ARCH}"
-    echo "雲端核心 'linux-image-cloud-${ARCH}' 已成功安裝/更新。"
-    echo "步驟 2: 移除通用核心元數據包以避免未來衝突..."
-    if dpkg -s "linux-image-${ARCH}" >/dev/null 2>&1; then
-        sudo -E apt ${APT_NONINTERACTIVE_OPTIONS} remove "linux-image-${ARCH}"
-        echo "通用核心元數據包 'linux-image-${ARCH}' 已被移除。"
-    else
-        echo "通用核心元數據包 'linux-image-${ARCH}' 未安裝，無需移除。"
+    
+    if dpkg -l | grep -q "linux-image-cloud-${ARCH}"; then
+        echo "雲端核心安裝成功，移除通用核心..."
+        if dpkg -s "linux-image-${ARCH}" >/dev/null 2>&1; then
+            sudo -E apt ${APT_NONINTERACTIVE_OPTIONS} remove "linux-image-${ARCH}"
+        fi
     fi
-    echo "✅ 系統已配置為專用雲端服務核心。"
-    echo "---------------------------------------------------------"
 }
 
-final_check_and_auto_reboot() {
+reboot_sequence() {
+    local msg=$1
     echo ""
-    echo "==== 驗證最終系統狀態 ===="
-    detect_system
-    echo ""
-    echo "✅ 升級流程已全部完成！日誌文件位於: $LOGFILE"
-    echo "系統將在 10 秒後自動重啟以應用所有變更（包括新的雲端核心）..."
+    echo "--- [6/7] $msg ---"
+    echo "正在恢復服務設定..."
+    restore_services # 【關鍵修復】：在重啟前顯式恢復服務
+    
+    echo "系統將在 10 秒後重啟..."
     sleep 10
-    echo "正在重啟..."
+    
+    # 解除 trap，避免退出時重複執行 restore_services (雖然重複執行也無害，但這樣更乾淨)
+    trap - EXIT 
+    
+    echo "REBOOTING NOW..."
     sudo reboot -f
+    sleep infinity
 }
 
 # --- 主流程 ---
-echo "========================================================="
-echo "  Debian 全自動無人值守【雲端核心】升級腳本 (最終修復版)"
-echo "========================================================="
-echo "日誌將被記錄到: $LOGFILE"
+check_root
+check_network
+check_disk_space
 
-# 在所有 apt 操作前，執行 debconf 預配置
+echo "========================================================="
+echo "  Debian 生產環境雲端升級腳本 (Final)"
+echo "========================================================="
+
 preseed_debconf
 configure_unattended_tools
 detect_system
 pause
 
-# 主升級流程
 run_upgrade_flow() {
-    local from_codename=$1
-    local to_codename=$2
-    echo "開始升級: $from_codename -> $to_codename..."
     backup_sources
-    fix_sources "$from_codename" "$to_codename"
+    fix_sources "$1" "$2"
     perform_upgrade
-    # 邏輯調整: 升級完系統後，立刻處理核心
     upgrade_to_cloud_kernel 
 }
 
 case "$SYSTEM_STATE" in
     bullseye)
+        echo "狀態: Debian 11 -> 12"
         run_upgrade_flow bullseye bookworm
-        echo ""
-        echo "✅ 第一階段完成！"
-        echo "🚨 正在自動重啟以應用 Debian 12 的雲端核心。請在重啟後，再次運行此腳本以繼續升級到 Debian 13。"
-        sleep 5
-        sudo reboot -f
+        reboot_sequence "第一階段完成，需要重啟加載新核心"
         ;;
     bookworm)
+        echo "狀態: Debian 12 -> 13"
         run_upgrade_flow bookworm trixie
-        echo "✅ 第二階段完成！"
-        final_check_and_auto_reboot
+        echo "--- [7/7] 升級全部完成 ---"
+        reboot_sequence "所有階段完成，執行最終重啟"
         ;;
     trixie)
-        echo "檢測到 Debian 13 (trixie)，系統已是最新。執行最終檢查和核心標準化。"
+        echo "狀態: 系統已是 Trixie"
         perform_upgrade
         upgrade_to_cloud_kernel
-        final_check_and_auto_reboot
-        ;;
-    MISMATCHED_KERNEL)
-        echo "檢測到核心與使用者空間版本不匹配，將嘗試修復..."
-        upgrade_to_cloud_kernel
-        echo "✅ 核心修復嘗試完成。"
-        final_check_and_auto_reboot
+        reboot_sequence "維護完成，執行重啟"
         ;;
     *)
-        echo "錯誤：未知的系統狀態 ($SYSTEM_STATE)，腳本終止。" >&2
-        exit 1
+        echo "未知狀態，執行通用更新"
+        perform_upgrade
+        upgrade_to_cloud_kernel
+        reboot_sequence "通用更新完成，執行重啟"
         ;;
 esac
 
